@@ -686,7 +686,7 @@ print(response.text)`;
                                                 <HelpTooltip
                                                     text={t('proxy.config.allow_lan_access_tooltip')}
                                                     ariaLabel={t('proxy.config.allow_lan_access')}
-                                                    placement="right"
+                                                    placement="top"
                                                 />
                                             </span>
                                             <input
@@ -722,7 +722,7 @@ print(response.text)`;
                                                     <HelpTooltip
                                                         text={t('proxy.config.auth.title_tooltip')}
                                                         ariaLabel={t('proxy.config.auth.title')}
-                                                        placement="right"
+                                                        placement="top"
                                                     />
                                                 </span>
                                             </label>
@@ -732,7 +732,7 @@ print(response.text)`;
                                                     <HelpTooltip
                                                         text={t('proxy.config.auth.enabled_tooltip')}
                                                         ariaLabel={t('proxy.config.auth.enabled')}
-                                                        placement="right"
+                                                        placement="left"
                                                     />
                                                 </span>
                                                 <input
@@ -754,7 +754,7 @@ print(response.text)`;
                                                     <HelpTooltip
                                                         text={t('proxy.config.auth.mode_tooltip')}
                                                         ariaLabel={t('proxy.config.auth.mode')}
-                                                        placement="right"
+                                                        placement="top"
                                                     />
                                                 </span>
                                             </label>
