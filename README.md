@@ -216,6 +216,22 @@ print(response.choices[0].message.content)
                 - 使用哈希算法生成稳定的 `call_id`
                 - 包含完整的工具调用信息 (`index`, `id`, `type`, `function.name`, `function.arguments`)
             - **影响范围**: 此修复确保了流式请求能够正确返回工具调用信息,与非流式响应和 Codex 流式响应的行为保持一致。所有使用 `stream: true` + `tools` 参数的客户端现在可以正常接收 Function Call 数据。
+        - **智能阈值回归 (Smart Threshold Recovery) - 解决 Issue #613**:
+            - **核心逻辑**: 实现了一种感知上下文负载的动态 Token 报告机制。
+            - **修复内容**:
+                - **三阶段缩放**: 在低负载(0-70%)保持高效压缩;在中负载(70-95%)平滑降低压缩率;在接近 100% 极限时真实上报(回归至 195k 左右)。
+                - **模型感应**: 处理器自动识别 1M (Flash) 和 2M (Pro) 的物理上下文界限。
+                - **400 错误拦截**: 即使触发物理溢出，代理层也会拦截 `Prompt is too long` 错误，并返回友好的中文/英文修复指引，引导用户执行 `/compact`。
+            - **影响范围**: 彻底解决了 Claude Code 在长对话场景下因不知道真实 Token 用量而拒绝压缩，最终导致 Gemini 服务端报错的问题。
+        - **Playwright MCP 连通性与稳定性增强 (参考 [Antigravity2Api](https://github.com/znlsl/Antigravity2Api)) - 解决 Issue #616**:
+            - **SSE 心跳保活**: 引入 15 秒定时心跳 (`: ping`)，解决长耗时工具调用导致的连接超时断开问题。
+            - **MCP XML Bridge**: 实现双向协议转换逻辑（指令注入 + 标签拦截），显著提升 MCP 工具（如 Playwright）在不稳定链路下的连通性。
+            - **上下文激进瘦身**: 
+                - **指令过滤**: 自动识别并移除 Claude Code 注入的冗余系统说明（~1-2k tokens）。
+                - **任务去重**: 剔除 tool_result 后重复的任务回显文本，物理减少 Context 占用。
+            - **智能 HTML 清理与截断**: 
+                - **深度剥离**: 针对浏览器快照自动移除 `<style>`、`<script>` 及内联 Base64 资源。
+                - **结构化截断**: 优化截断算法，确保不在 HTML 标签或 JSON 中间切断，避免产生破坏性的 400 结构错误。
     *   **v3.3.28 (2026-01-14)**:
         - **OpenAI Thinking Content 修复 (PR #604)**:
             - **修复 Gemini 3 Pro thinking 内容丢失**: 在流式响应收集器中添加 `reasoning_content` 累积逻辑,解决了 Gemini 3 Pro (high/low) 非流式响应中思考内容丢失的问题。

@@ -198,6 +198,22 @@ print(response.choices[0].message.content)
                 - Used hash algorithm to generate stable `call_id`
                 - Included complete tool call information (`index`, `id`, `type`, `function.name`, `function.arguments`)
             - **Impact**: This fix ensures streaming requests correctly return tool call information, maintaining consistency with non-streaming responses and Codex streaming responses. All clients using `stream: true` + `tools` parameters can now properly receive Function Call data.
+        - **Smart Threshold Recovery - Resolve Issue #613**:
+            - **Core Logic**: Implemented a dynamic token reporting mechanism perceived to context load.
+            - **Fix Details**:
+                - **Three-Stage Scaling**: Maintains efficient compression at low loads (0-70%), smoothly reduces compression rate at medium loads (70-95%), and reports real usage near the 100% limit (regressing to ~195k).
+                - **Model Awareness**: Processor automatically identifies physical context boundaries for 1M (Flash) and 2M (Pro).
+                - **400 Error Interception**: Even if physical overflow occurs, the proxy intercepts `Prompt is too long` errors and returns friendly guidance, directing users to execute `/compact`.
+            - **Impact**: Completely resolved the issue where Claude Code refused to compress due to hidden token usage, ultimately leading to Gemini server errors in long conversation scenarios.
+        - **Playwright MCP Stability & Connectivity Enhancement (Inspired by [Antigravity2Api](https://github.com/znlsl/Antigravity2Api)) - Resolve Issue #616**:
+            - **SSE Keep-Alive**: Introduced 15s heartbeats (`: ping`) to prevent connection timeouts during long-running tool calls.
+            - **MCP XML Bridge**: Bidirectional protocol conversion (instruction injection + label interception), significantly improving reliability for MCP tools (like Playwright).
+            - **Aggressive Context Slimming**:
+                - **Instruction Filtering**: Automatically removes redundant Claude Code system instructions (~1-2k tokens).
+                - **Task Deduplication**: Strips repeated task echo text following tool results to further reduce context usage.
+            - **Intelligent HTML Cleaning & Truncation**:
+                - **Deep Stripping**: Automatically removes `<style>`, `<script>`, and inline Base64 resources from browser snapshots.
+                - **Structured Truncation**: Enhanced truncation algorithm prevents cutting through HTML tags or JSON objects, avoiding 400 structure errors.
     *   **v3.3.28 (2026-01-14)**:
         - **OpenAI Thinking Content Fix (PR #604)**:
             - **Fixed Gemini 3 Pro Thinking Content Loss**: Added `reasoning_content` accumulation logic in streaming response collector, resolving the issue where Gemini 3 Pro (high/low) non-streaming responses lost thinking content.
