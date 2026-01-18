@@ -196,7 +196,7 @@ print(response.choices[0].message.content)
             - **Automatic Signature Completion**: For tool calls like LS, Bash, and TodoWrite that missing `thought_signature`, the proxy now automatically injects a placeholder to satisfy upstream constraints.
         - **Architectural Robustness**:
             - Enhanced the global recursive cleaner `clean_cache_control_from_messages` to strip illegal `cache_control` tags that disrupt Vertex AI/Anthropic strict mode.
-            - Updated comprehensive test examples in [client_test_examples.md] covering all known 400 error scenarios.
+            - Updated comprehensive test examples in [docs/client_test_examples.md](docs/client_test_examples.md) covering all known 400 error scenarios.
     *   **v3.3.39 (2026-01-17)**:
         - **Deep Proxy Optimizations (Gemini Stability Boost)**:
             - **Schema Purifier Upgrade**: Supported `allOf` merging, intelligent union type selection, automatic Nullable filtering, and empty object parameter backfill, completely resolving 400 errors caused by complex tool definitions.

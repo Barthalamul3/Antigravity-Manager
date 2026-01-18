@@ -214,7 +214,7 @@ print(response.choices[0].message.content)
             - **签名缺失自动补完**: 针对 LS、Bash、TodoWrite 等工具调用缺失 `thought_signature` 的情况，自动注入通用校验占位符，确保协议链路畅通。
         - **架构健壮性优化**:
             - 增强了全局递归清理函数 `clean_cache_control_from_messages`，确保 `cache_control` 不会干扰 Vertex AI/Anthropic 严格模式。
-            - 完善了错误日志系统，建立了详细的场景对照表并记录于 [client_test_examples.md]。
+            - 完善了错误日志系统，建立了详细的场景对照表并记录于 [docs/client_test_examples.md](docs/client_test_examples.md)。
     *   **v3.3.39 (2026-01-17)**:
         - **代理深度优化 (Gemini 稳定性增强)**：
             - **Schema 净化器升级**：支持 `allOf` 合并、智能联合类型选择、Nullable 自动过滤及空对象参数补全，彻底解决复杂工具定义导致的 400 错误。
