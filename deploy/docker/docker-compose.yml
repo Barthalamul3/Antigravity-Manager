@@ -2,6 +2,7 @@ services:
   antigravity:
     container_name: antigravity-manager
     build: .
+    init: true
     ports:
       - "${NOVNC_PORT:-6080}:${NOVNC_PORT:-6080}"
       - "8045:8045"
