@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Save, Github, User, MessageCircle, ExternalLink, RefreshCw, Sparkles, Heart, Coffee } from 'lucide-react';
+import { Save, Github, User, MessageCircle, ExternalLink, RefreshCw, Heart, Coffee } from 'lucide-react';
 import { request as invoke } from '../utils/request';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useConfigStore } from '../stores/useConfigStore';
@@ -9,15 +9,20 @@ import { showToast } from '../components/common/ToastContainer';
 import QuotaProtection from '../components/settings/QuotaProtection';
 import SmartWarmup from '../components/settings/SmartWarmup';
 import PinnedQuotaModels from '../components/settings/PinnedQuotaModels';
+import ThinkingBudget from '../components/settings/ThinkingBudget';
+import { useDebugConsole } from '../stores/useDebugConsole';
 
 import { useTranslation } from 'react-i18next';
 import { isTauri } from '../utils/env';
+import DebugConsole from '../components/debug/DebugConsole';
+import ProxyPoolSettings from '../components/settings/ProxyPoolSettings';
 
 
 function Settings() {
     const { t, i18n } = useTranslation();
     const { config, loadConfig, saveConfig, updateLanguage, updateTheme } = useConfigStore();
-    const [activeTab, setActiveTab] = useState<'general' | 'account' | 'proxy' | 'advanced' | 'about'>('general');
+    const { enable, disable, isEnabled } = useDebugConsole();
+    const [activeTab, setActiveTab] = useState<'general' | 'account' | 'proxy' | 'advanced' | 'debug' | 'about'>('general');
     const [formData, setFormData] = useState<AppConfig>({
         language: 'zh',
         theme: 'system',
@@ -35,6 +40,17 @@ function Settings() {
             upstream_proxy: {
                 enabled: false,
                 url: ''
+            },
+            debug_logging: {
+                enabled: false,
+                output_dir: undefined
+            } as { enabled: boolean; output_dir?: string },
+            proxy_pool: {
+                enabled: false,
+                proxies: [],
+                health_check_interval: 300,
+                auto_failover: true,
+                strategy: 'priority'
             }
         },
         scheduled_warmup: {
@@ -50,9 +66,10 @@ function Settings() {
             models: ['gemini-3-pro-high', 'gemini-3-flash', 'gemini-3-pro-image', 'claude-sonnet-4-5-thinking']
         },
         circuit_breaker: {
-            enabled: true,
-            backoff_steps: [60, 300, 1800, 7200]
-        }
+            enabled: false,
+            backoff_steps: [30, 60, 120, 300, 600]
+        },
+
     });
 
     // Dialog state
@@ -61,6 +78,11 @@ function Settings() {
     const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
     const [dataDirPath, setDataDirPath] = useState<string>('~/.antigravity_tools/');
 
+    // Antigravity cache clearing state
+    const [isClearCacheOpen, setIsClearCacheOpen] = useState(false);
+    const [cachePaths, setCachePaths] = useState<string[]>([]);
+    const [isClearingCache, setIsClearingCache] = useState(false);
+
     // Update check state
     const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
     const [updateInfo, setUpdateInfo] = useState<{
@@ -68,6 +90,7 @@ function Settings() {
         latestVersion: string;
         currentVersion: string;
         downloadUrl: string;
+        source?: string;
     } | null>(null);
 
 
@@ -104,6 +127,8 @@ function Settings() {
             setFormData(config);
         }
     }, [config]);
+
+    // 删除自动启用调试控制台的逻辑 - 改为用户手动控制
 
     const handleSave = async () => {
         try {
@@ -177,6 +202,29 @@ function Settings() {
         }
     };
 
+    const handleSelectDebugLogDir = async () => {
+        try {
+            const selected = await open({
+                directory: true,
+                multiple: false,
+                title: t('settings.advanced.debug_log_dir_select', '选择调试日志输出目录'),
+            });
+            if (selected && typeof selected === 'string') {
+                setFormData({
+                    ...formData,
+                    proxy: {
+                        ...formData.proxy,
+                        debug_logging: {
+                            enabled: formData.proxy?.debug_logging?.enabled ?? false,
+                            output_dir: selected,
+                        },
+                    },
+                });
+            }
+        } catch (error) {
+            showToast(`${t('common.error')}: ${error}`, 'error');
+        }
+    };
 
     const handleDetectAntigravityPath = async () => {
         try {
@@ -198,6 +246,7 @@ function Settings() {
                 latest_version: string;
                 current_version: string;
                 download_url: string;
+                source?: string;
             }>('check_for_updates');
 
             setUpdateInfo({
@@ -205,10 +254,12 @@ function Settings() {
                 latestVersion: result.latest_version,
                 currentVersion: result.current_version,
                 downloadUrl: result.download_url,
+                source: result.source,
             });
 
             if (result.has_update) {
-                showToast(t('settings.about.new_version_available', { version: result.latest_version }), 'info');
+                const sourceMsg = result.source && result.source !== 'GitHub API' ? ` (via ${result.source})` : '';
+                showToast(t('settings.about.new_version_available', { version: result.latest_version }) + sourceMsg, 'info');
             } else {
                 showToast(t('settings.about.latest_version'), 'success');
             }
@@ -216,6 +267,46 @@ function Settings() {
             showToast(`${t('settings.about.update_check_failed')}: ${error}`, 'error');
         } finally {
             setIsCheckingUpdate(false);
+        }
+    };
+
+    // Handle opening cache clear dialog
+    const handleOpenClearCacheDialog = async () => {
+        try {
+            const paths = await invoke<string[]>('get_antigravity_cache_paths');
+            setCachePaths(paths);
+            setIsClearCacheOpen(true);
+        } catch (error) {
+            // If no cache paths found, still allow opening the dialog
+            setCachePaths([]);
+            setIsClearCacheOpen(true);
+        }
+    };
+
+    // Handle clearing Antigravity cache
+    const confirmClearAntigravityCache = async () => {
+        setIsClearingCache(true);
+        try {
+            const result = await invoke<{
+                cleared_paths: string[];
+                total_size_freed: number;
+                errors: string[];
+            }>('clear_antigravity_cache');
+
+            const sizeMB = (result.total_size_freed / 1024 / 1024).toFixed(2);
+
+            if (result.cleared_paths.length > 0) {
+                showToast(t('settings.advanced.cache_cleared_success', { size: sizeMB }), 'success');
+            } else if (result.errors.length > 0) {
+                showToast(`${t('common.error')}: ${result.errors[0]}`, 'error');
+            } else {
+                showToast(t('settings.advanced.cache_not_found'), 'info');
+            }
+        } catch (error) {
+            showToast(`${t('common.error')}: ${error}`, 'error');
+        } finally {
+            setIsClearingCache(false);
+            setIsClearCacheOpen(false);
         }
     };
 
@@ -261,6 +352,15 @@ function Settings() {
                             onClick={() => setActiveTab('advanced')}
                         >
                             {t('settings.tabs.advanced')}
+                        </button>
+                        <button
+                            className={`px-6 py-2 rounded-full text-sm font-medium transition-all ${activeTab === 'debug'
+                                ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
+                                : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
+                                }`}
+                            onClick={() => setActiveTab('debug')}
+                        >
+                            {t('settings.tabs.debug')}
                         </button>
                         <button
                             className={`px-6 py-2 rounded-full text-sm font-medium transition-all ${activeTab === 'about'
@@ -699,80 +799,208 @@ function Settings() {
                                         </button>
                                     </div>
                                 </div>
+
+                                {/* Antigravity 缓存清理 */}
+                                <div className="border-t border-gray-200 dark:border-base-200 pt-4">
+                                    <h3 className="font-medium text-gray-900 dark:text-base-content mb-3">{t('settings.advanced.antigravity_cache_title', 'Antigravity 缓存清理')}</h3>
+                                    <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700/30 rounded-lg p-3 mb-3">
+                                        <p className="text-sm text-amber-700 dark:text-amber-400">{t('settings.advanced.antigravity_cache_warning', '请确保 Antigravity 应用已完全退出后再执行清理操作。')}</p>
+                                    </div>
+                                    <div className="bg-gray-50 dark:bg-base-200 border border-gray-200 dark:border-base-300 rounded-lg p-3 mb-3">
+                                        <p className="text-sm text-gray-600 dark:text-gray-400">{t('settings.advanced.antigravity_cache_desc', '清理 Antigravity 应用的缓存可以解决登录失败、版本验证错误、OAuth 授权失败等问题。')}</p>
+                                    </div>
+                                    <div className="flex items-center gap-4">
+                                        <button
+                                            className="px-4 py-2 border border-orange-300 dark:border-orange-700 text-orange-700 dark:text-orange-400 rounded-lg hover:bg-orange-50 dark:hover:bg-orange-900/20 transition-colors"
+                                            onClick={handleOpenClearCacheDialog}
+                                        >
+                                            {t('settings.advanced.clear_antigravity_cache', '清理 Antigravity 缓存')}
+                                        </button>
+                                    </div>
+                                </div>
+
+
+
+                                <div className="border-t border-gray-200 dark:border-base-200 pt-4">
+                                    <div className="space-y-3">
+                                        <div className="flex items-center justify-between p-4 bg-gray-50 dark:bg-base-200 rounded-lg border border-gray-100 dark:border-base-300">
+                                            <div>
+                                                <div className="font-medium text-gray-900 dark:text-base-content">
+                                                    {t('settings.advanced.debug_logs_title', '调试日志')}
+                                                </div>
+                                                <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                                                    {t('settings.advanced.debug_logs_enable_desc', '启用后会记录完整请求与响应链路，建议仅在排查问题时开启。')}
+                                                </p>
+                                            </div>
+                                            <label className="relative inline-flex items-center cursor-pointer">
+                                                <input
+                                                    type="checkbox"
+                                                    className="sr-only peer"
+                                                    checked={formData.proxy?.debug_logging?.enabled ?? false}
+                                                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFormData({
+                                                        ...formData,
+                                                        proxy: {
+                                                            ...formData.proxy,
+                                                            debug_logging: {
+                                                                enabled: e.target.checked,
+                                                                output_dir: formData.proxy?.debug_logging?.output_dir,
+                                                            },
+                                                        },
+                                                    })}
+                                                />
+                                                <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 dark:peer-focus:ring-blue-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
+                                            </label>
+                                        </div>
+                                        {(formData.proxy?.debug_logging?.enabled ?? false) && (
+                                            <>
+                                                <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700/30 rounded-lg p-3">
+                                                    <p className="text-sm text-amber-700 dark:text-amber-400">
+                                                        {t('settings.advanced.debug_logs_desc', '记录完整链路：原始输入、转换后的 v1internal 请求、以及上游响应。仅用于问题排查，可能包含敏感数据。')}
+                                                    </p>
+                                                </div>
+                                                <div>
+                                                    <label className="block text-sm font-medium text-gray-900 dark:text-base-content mb-1">
+                                                        {t('settings.advanced.debug_log_dir', '调试日志输出目录')}
+                                                    </label>
+                                                    <div className="flex gap-2">
+                                                        <input
+                                                            type="text"
+                                                            className="flex-1 px-4 py-3 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-gray-900 dark:text-base-content font-medium"
+                                                            value={formData.proxy?.debug_logging?.output_dir || ''}
+                                                            placeholder={`${dataDirPath.replace(/\/$/, '')}/debug_logs`}
+                                                            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFormData({
+                                                                ...formData,
+                                                                proxy: {
+                                                                    ...formData.proxy,
+                                                                    debug_logging: {
+                                                                        enabled: formData.proxy?.debug_logging?.enabled ?? false,
+                                                                        output_dir: e.target.value || undefined,
+                                                                    },
+                                                                },
+                                                            })}
+                                                        />
+                                                        {isTauri() && (
+                                                            <button
+                                                                className="px-4 py-2 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-base-200 transition-colors"
+                                                                onClick={handleSelectDebugLogDir}
+                                                            >
+                                                                {t('settings.advanced.select_btn')}
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-2">
+                                                        {t('settings.advanced.debug_log_dir_hint', `不填写则使用默认目录：${dataDirPath.replace(/\/$/, '')}/debug_logs`)}
+                                                    </p>
+                                                </div>
+                                            </>
+                                        )}
+                                    </div>
+                                </div>
+
+                                {/* Thinking Budget 设置 */}
+                                <div className="border-t border-gray-200 dark:border-base-200 pt-4">
+                                    <ThinkingBudget
+                                        config={formData.proxy?.thinking_budget || { mode: 'auto', custom_value: 24576 }}
+                                        onChange={(newConfig) => setFormData({
+                                            ...formData,
+                                            proxy: {
+                                                ...formData.proxy,
+                                                thinking_budget: newConfig,
+                                            },
+                                        })}
+                                    />
+                                </div>
                             </div>
                         </>
                     )}
 
-                    {/* 代理设置 */}
-                    {activeTab === 'proxy' && (
-                        <div className="space-y-6">
-                            <h2 className="text-lg font-semibold text-gray-900 dark:text-base-content">{t('settings.proxy.title')}</h2>
 
-                            <div className="p-4 bg-gray-50 dark:bg-base-200 rounded-lg border border-gray-100 dark:border-base-300">
-                                <h3 className="text-md font-semibold text-gray-900 dark:text-base-content mb-3 flex items-center gap-2">
-                                    <Sparkles size={18} className="text-blue-500" />
-                                    {t('proxy.config.upstream_proxy.title')}
-                                </h3>
-                                <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
-                                    {t('proxy.config.upstream_proxy.desc')}
-                                </p>
+                    {/* 调试设置 */}
+                    {activeTab === 'debug' && (
+                        <div className="space-y-4 animate-in fade-in duration-500">
+                            {/* 标题和开关 */}
+                            <div className="flex items-center justify-between">
+                                <div>
+                                    <h2 className="text-lg font-semibold text-gray-900 dark:text-base-content">
+                                        {t('settings.debug.title', '调试控制台')}
+                                    </h2>
+                                    <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+                                        {t('settings.debug.desc', '实时查看应用日志，用于调试和问题排查')}
+                                    </p>
+                                </div>
+                                <label className="relative inline-flex items-center cursor-pointer">
+                                    <input
+                                        type="checkbox"
+                                        className="sr-only peer"
+                                        checked={isEnabled}
+                                        onChange={(e) => e.target.checked ? enable() : disable()}
+                                    />
+                                    <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 dark:peer-focus:ring-blue-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
+                                    <span className="ml-3 text-sm font-medium text-gray-700 dark:text-gray-300">
+                                        {isEnabled ? t('settings.debug.enabled', '已启用') : t('settings.debug.disabled', '已禁用')}
+                                    </span>
+                                </label>
+                            </div>
 
-                                <div className="space-y-4">
-                                    <div className="flex items-center">
-                                        <label className="flex items-center cursor-pointer gap-3">
-                                            <div className="relative">
-                                                <input
-                                                    type="checkbox"
-                                                    className="sr-only"
-                                                    checked={formData.proxy?.upstream_proxy?.enabled || false}
-                                                    onChange={(e) => setFormData({
-                                                        ...formData,
-                                                        proxy: {
-                                                            ...formData.proxy,
-                                                            upstream_proxy: {
-                                                                ...formData.proxy.upstream_proxy,
-                                                                enabled: e.target.checked
-                                                            }
-                                                        }
-                                                    })}
-                                                />
-                                                <div className={`block w-14 h-8 rounded-full transition-colors ${formData.proxy?.upstream_proxy?.enabled ? 'bg-blue-500' : 'bg-gray-300 dark:bg-base-300'}`}></div>
-                                                <div className={`dot absolute left-1 top-1 bg-white w-6 h-6 rounded-full transition-transform ${formData.proxy?.upstream_proxy?.enabled ? 'transform translate-x-6' : ''}`}></div>
-                                            </div>
-                                            <span className="text-sm font-medium text-gray-900 dark:text-base-content">
-                                                {t('proxy.config.upstream_proxy.enable')}
-                                            </span>
-                                        </label>
-                                    </div>
-
-                                    <div>
-                                        <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                                            {t('proxy.config.upstream_proxy.url')}
-                                        </label>
-                                        <input
-                                            type="text"
-                                            value={formData.proxy?.upstream_proxy?.url || ''}
-                                            onChange={(e) => setFormData({
-                                                ...formData,
-                                                proxy: {
-                                                    ...formData.proxy,
-                                                    upstream_proxy: {
-                                                        ...formData.proxy.upstream_proxy,
-                                                        url: e.target.value
-                                                    }
-                                                }
-                                            })}
-                                            placeholder={t('proxy.config.upstream_proxy.url_placeholder')}
-                                            className="w-full px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-900 dark:text-base-content bg-gray-50 dark:bg-base-200"
-                                        />
-                                        <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                                            {t('proxy.config.upstream_proxy.tip')}
+                            {/* 控制台或提示 */}
+                            {isEnabled ? (
+                                <div className="h-[calc(100vh-320px)] min-h-[400px]">
+                                    <DebugConsole embedded />
+                                </div>
+                            ) : (
+                                <div className="h-[calc(100vh-320px)] min-h-[400px] flex items-center justify-center bg-gray-50 dark:bg-base-200 rounded-xl border border-gray-200 dark:border-base-300">
+                                    <div className="text-center">
+                                        <p className="text-gray-500 dark:text-gray-400 text-lg font-medium">
+                                            {t('settings.debug.disabled_hint', '调试控制台已关闭')}
+                                        </p>
+                                        <p className="text-gray-400 dark:text-gray-500 text-sm mt-2">
+                                            {t('settings.debug.disabled_desc', '开启后将实时记录应用日志')}
                                         </p>
                                     </div>
                                 </div>
-                            </div>
+                            )}
                         </div>
                     )}
+
+                    {/* 代理设置 */}
+                    {activeTab === 'proxy' && (
+                        <div className="space-y-4 animate-in fade-in duration-300">
+                            <ProxyPoolSettings
+                                config={formData.proxy?.proxy_pool || {
+                                    enabled: false,
+                                    proxies: [],
+                                    health_check_interval: 300,
+                                    auto_failover: true,
+                                    strategy: 'priority'
+                                }}
+                                onChange={(newConfig, silent = false) => {
+                                    const updatedFormData = {
+                                        ...formData,
+                                        proxy: {
+                                            ...formData.proxy,
+                                            proxy_pool: newConfig
+                                        }
+                                    };
+                                    setFormData(updatedFormData);
+
+                                    // [FIX] Silent updates (like health polling) should NOT trigger saveConfig
+                                    // to prevent race conditions where old memory state rolls back new manual changes
+                                    if (silent) {
+                                        console.log('Proxy status sync (silent)');
+                                        return;
+                                    }
+
+                                    // Hot reload: save immediately for manual changes
+                                    saveConfig({ ...updatedFormData, auto_refresh: true })
+                                        .then(() => {
+                                            console.log('Proxy config saved');
+                                        })
+                                        .catch(err => console.error('Save failed:', err));
+                                }}
+                            />
+                        </div>
+                    )}
+
                     {activeTab === 'about' && (
                         <div className="flex flex-col h-full animate-in fade-in duration-500">
                             <div className="flex-1 flex flex-col justify-center items-center space-y-8">
@@ -790,11 +1018,9 @@ function Settings() {
                                     <div>
                                         <h3 className="text-3xl font-black text-gray-900 dark:text-base-content tracking-tight mb-2">Antigravity Tools</h3>
                                         <div className="flex items-center justify-center gap-2 text-sm">
-                                            <span className="px-2.5 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 font-medium border border-blue-200 dark:border-blue-800">
-                                                v4.0.7
-                                            </span>
+                                            v4.1.1
                                             <span className="text-gray-400 dark:text-gray-600">•</span>
-                                            <span className="text-gray-500 dark:text-gray-400">Professional Account Management</span>
+                                            <span className="text-gray-500 dark:text-gray-400">{t('settings.branding.subtitle')}</span>
                                         </div>
                                     </div>
                                 </div>
@@ -913,8 +1139,9 @@ function Settings() {
                                 {t('settings.about.copyright')}
                             </div>
                         </div>
-                    )}
-                </div>
+                    )
+                    }
+                </div >
 
                 <ModalDialog
                     isOpen={isClearLogsOpen}
@@ -927,6 +1154,44 @@ function Settings() {
                     onConfirm={confirmClearLogs}
                     onCancel={() => setIsClearLogsOpen(false)}
                 />
+
+                {/* Antigravity Cache Clear Modal */}
+                <ModalDialog
+                    isOpen={isClearCacheOpen}
+                    title={t('settings.advanced.clear_cache_confirm_title', '确认清理 Antigravity 缓存')}
+                    type="confirm"
+                    confirmText={isClearingCache ? t('common.clearing', '清理中...') : t('common.clear')}
+                    cancelText={t('common.cancel')}
+                    isDestructive={true}
+                    onConfirm={confirmClearAntigravityCache}
+                    onCancel={() => setIsClearCacheOpen(false)}
+                >
+                    <div className="space-y-3">
+                        <p className="text-sm text-gray-600 dark:text-gray-400">
+                            {t('settings.advanced.clear_cache_confirm_msg', '将清理以下缓存目录：')}
+                        </p>
+                        {cachePaths.length > 0 ? (
+                            <div className="bg-gray-50 dark:bg-base-200 rounded-lg p-3 max-h-40 overflow-y-auto">
+                                <ul className="text-xs font-mono text-gray-600 dark:text-gray-400 space-y-1">
+                                    {cachePaths.map((path, index) => (
+                                        <li key={index} className="truncate">• {path}</li>
+                                    ))}
+                                </ul>
+                            </div>
+                        ) : (
+                            <div className="bg-gray-50 dark:bg-base-200 rounded-lg p-3">
+                                <p className="text-xs text-gray-500 dark:text-gray-400">
+                                    {t('settings.advanced.cache_not_found', '未找到 Antigravity 缓存目录')}
+                                </p>
+                            </div>
+                        )}
+                        <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700/30 rounded-lg p-2">
+                            <p className="text-xs text-amber-700 dark:text-amber-400">
+                                {t('settings.advanced.antigravity_cache_warning', '请确保 Antigravity 应用已完全退出后再执行清理操作。')}
+                            </p>
+                        </div>
+                    </div>
+                </ModalDialog>
 
                 {/* Support Modal */}
                 <div className={`modal ${isSupportModalOpen ? 'modal-open' : ''} z-[100]`}>
@@ -965,7 +1230,7 @@ function Settings() {
                                     <div className="w-full aspect-square relative bg-white rounded-xl overflow-hidden shadow-sm border border-gray-100">
                                         <img src="/images/donate/coffee.png" alt="Buy Me A Coffee" className="w-full h-full object-contain" />
                                     </div>
-                                    <span className="text-xs font-bold text-gray-700 dark:text-gray-300">Buy Me a Coffee</span>
+                                    <span className="text-xs font-bold text-gray-700 dark:text-gray-300">{t('settings.about.support_buymeacoffee')}</span>
                                 </div>
                             </div>
 
@@ -979,7 +1244,7 @@ function Settings() {
                     </div>
                     <div className="modal-backdrop bg-black/60 backdrop-blur-md fixed inset-0 z-[-1]" onClick={() => setIsSupportModalOpen(false)}></div>
                 </div>
-            </div>
+            </div >
         </div >
     );
 }

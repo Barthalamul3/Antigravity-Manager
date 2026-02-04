@@ -7,6 +7,7 @@ use crate::proxy::mappers::gemini::{wrap_request, unwrap_response};
 use crate::proxy::server::AppState;
 use crate::proxy::session_manager::SessionManager;
 use crate::proxy::handlers::common::{determine_retry_strategy, apply_retry_strategy, should_rotate_account, RetryStrategy};
+use crate::proxy::debug_logger;
 use tokio::time::Duration;
  
 const MAX_RETRY_ATTEMPTS: usize = 3;
@@ -26,10 +27,23 @@ pub async fn handle_generate(
     };
 
     crate::modules::logger::log_info(&format!("Received Gemini request: {}/{}", model_name, method));
+    let trace_id = format!("req_{}", chrono::Utc::now().timestamp_subsec_millis());
+    let debug_cfg = state.debug_logging.read().await.clone();
 
     // 1. 验证方法
     if method != "generateContent" && method != "streamGenerateContent" {
         return Err((StatusCode::BAD_REQUEST, format!("Unsupported method: {}", method)));
+    }
+    if debug_logger::is_enabled(&debug_cfg) {
+        let original_payload = json!({
+            "kind": "original_request",
+            "protocol": "gemini",
+            "trace_id": trace_id,
+            "original_model": model_name,
+            "method": method,
+            "request": body.clone(),
+        });
+        debug_logger::write_debug_payload(&debug_cfg, Some(&trace_id), "original_request", &original_payload).await;
     }
     let client_wants_stream = method == "streamGenerateContent";
     // [AUTO-CONVERSION] 强制内部流式化
@@ -81,7 +95,7 @@ pub async fn handle_generate(
         let session_id = SessionManager::extract_gemini_session_id(&body, &model_name);
 
         // 关键：在重试尝试 (attempt > 0) 时强制轮换账号
-        let (access_token, project_id, email, _wait_ms) = match token_manager.get_token(&config.request_type, attempt > 0, Some(&session_id), &config.final_model).await {
+        let (access_token, project_id, email, account_id, _wait_ms) = match token_manager.get_token(&config.request_type, attempt > 0, Some(&session_id), &config.final_model).await {
             Ok(t) => t,
             Err(e) => {
                 return Err((StatusCode::SERVICE_UNAVAILABLE, format!("Token error: {}", e)));
@@ -95,12 +109,26 @@ pub async fn handle_generate(
         // [FIX #765] Pass session_id to wrap_request for signature injection
         let wrapped_body = wrap_request(&body, &project_id, &mapped_model, Some(&session_id));
 
+        if debug_logger::is_enabled(&debug_cfg) {
+            let payload = json!({
+                "kind": "v1internal_request",
+                "protocol": "gemini",
+                "trace_id": trace_id,
+                "original_model": model_name,
+                "mapped_model": mapped_model,
+                "request_type": config.request_type,
+                "attempt": attempt,
+                "v1internal_request": wrapped_body.clone(),
+            });
+            debug_logger::write_debug_payload(&debug_cfg, Some(&trace_id), "v1internal_request", &payload).await;
+        }
+
         // 5. 上游调用
         let query_string = if is_stream { Some("alt=sse") } else { None };
         let upstream_method = if is_stream { "streamGenerateContent" } else { "generateContent" };
 
         let response = match upstream
-            .call_v1_internal(upstream_method, &access_token, wrapped_body, query_string)
+            .call_v1_internal(upstream_method, &access_token, wrapped_body, query_string, Some(account_id.as_str()))
             .await {
                 Ok(r) => r,
                 Err(e) => {
@@ -119,7 +147,22 @@ pub async fn handle_generate(
                 use bytes::{Bytes, BytesMut};
                 use futures::StreamExt;
                 
-                let mut response_stream = response.bytes_stream();
+                let meta = json!({
+                    "protocol": "gemini",
+                    "trace_id": trace_id,
+                    "original_model": model_name,
+                    "mapped_model": mapped_model,
+                    "request_type": config.request_type,
+                    "attempt": attempt,
+                    "status": status.as_u16(),
+                });
+                let mut response_stream = debug_logger::wrap_reqwest_stream_with_debug(
+                    Box::pin(response.bytes_stream()),
+                    debug_cfg.clone(),
+                    trace_id.clone(),
+                    "upstream_response",
+                    meta,
+                );
                 let mut buffer = BytesMut::new();
                 let s_id = session_id.clone(); // Clone for stream closure
 
@@ -309,6 +352,20 @@ pub async fn handle_generate(
         let retry_after = response.headers().get("Retry-After").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
         let error_text = response.text().await.unwrap_or_else(|_| format!("HTTP {}", status_code));
         last_error = format!("HTTP {}: {}", status_code, error_text);
+        if debug_logger::is_enabled(&debug_cfg) {
+            let payload = json!({
+                "kind": "upstream_response_error",
+                "protocol": "gemini",
+                "trace_id": trace_id,
+                "original_model": model_name,
+                "mapped_model": mapped_model,
+                "request_type": config.request_type,
+                "attempt": attempt,
+                "status": status_code,
+                "error_text": error_text,
+            });
+            debug_logger::write_debug_payload(&debug_cfg, Some(&trace_id), "upstream_response_error", &payload).await;
+        }
  
         // 确定重试策略
         let strategy = determine_retry_strategy(status_code, &error_text, false);
@@ -398,7 +455,7 @@ pub async fn handle_get_model(Path(model_name): Path<String>) -> impl IntoRespon
 
 pub async fn handle_count_tokens(State(state): State<AppState>, Path(_model_name): Path<String>, Json(_body): Json<Value>) -> Result<impl IntoResponse, (StatusCode, String)> {
     let model_group = "gemini";
-    let (_access_token, _project_id, _, _wait_ms) = state.token_manager.get_token(model_group, false, None, "gemini").await
+    let (_access_token, _project_id, _, _, _wait_ms) = state.token_manager.get_token(model_group, false, None, "gemini").await
         .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("Token error: {}", e)))?;
     
     Ok(Json(json!({"totalTokens": 0})))

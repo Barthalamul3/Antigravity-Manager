@@ -12,6 +12,7 @@ use crate::proxy::mappers::openai::{
 };
 // use crate::proxy::upstream::client::UpstreamClient; // 通过 state 获取
 use crate::proxy::server::AppState;
+use crate::proxy::debug_logger;
 
 const MAX_RETRY_ATTEMPTS: usize = 3;
 use super::common::{
@@ -24,6 +25,10 @@ pub async fn handle_chat_completions(
     State(state): State<AppState>,
     Json(mut body): Json<Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // [FIX] 保存原始请求体的完整副本，用于日志记录
+    // 这确保了即使结构体定义遗漏字段，日志也能完整记录所有参数
+    let original_body = body.clone();
+
     // [NEW] 自动检测并转换 Responses 格式
     // 如果请求包含 instructions 或 input 但没有 messages，则认为是 Responses 格式
     let is_responses_format = !body.get("messages").is_some()
@@ -98,6 +103,18 @@ pub async fn handle_chat_completions(
         "[{}] OpenAI Chat Request: {} | {} messages | stream: {}",
         trace_id, openai_req.model, openai_req.messages.len(), openai_req.stream
     );
+    let debug_cfg = state.debug_logging.read().await.clone();
+    if debug_logger::is_enabled(&debug_cfg) {
+        // [FIX] 使用原始 body 副本记录日志，确保不丢失任何字段
+        let original_payload = json!({
+            "kind": "original_request",
+            "protocol": "openai",
+            "trace_id": trace_id,
+            "original_model": openai_req.model,
+            "request": original_body,  // 使用原始请求体，不是结构体序列化
+        });
+        debug_logger::write_debug_payload(&debug_cfg, Some(&trace_id), "original_request", &original_payload).await;
+    }
 
     // 1. 获取 UpstreamClient (Clone handle)
     let upstream = state.upstream.clone();
@@ -134,7 +151,7 @@ pub async fn handle_chat_completions(
 
         // 4. 获取 Token (使用准确的 request_type)
         // 关键：在重试尝试 (attempt > 0) 时强制轮换账号
-        let (access_token, project_id, email, _wait_ms) = match token_manager
+        let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
             .get_token(
                 &config.request_type,
                 attempt > 0,
@@ -162,6 +179,20 @@ pub async fn handle_chat_completions(
         // 4. 转换请求
         let gemini_body = transform_openai_request(&openai_req, &project_id, &mapped_model);
 
+        if debug_logger::is_enabled(&debug_cfg) {
+            let payload = json!({
+                "kind": "v1internal_request",
+                "protocol": "openai",
+                "trace_id": trace_id,
+                "original_model": openai_req.model,
+                "mapped_model": mapped_model,
+                "request_type": config.request_type,
+                "attempt": attempt,
+                "v1internal_request": gemini_body.clone(),
+            });
+            debug_logger::write_debug_payload(&debug_cfg, Some(&trace_id), "v1internal_request", &payload).await;
+        }
+
         // [New] 打印转换后的报文 (Gemini Body) 供调试
         if let Ok(body_json) = serde_json::to_string_pretty(&gemini_body) {
             debug!("[OpenAI-Request] Transformed Gemini Body:\n{}", body_json);
@@ -187,7 +218,7 @@ pub async fn handle_chat_completions(
         let query_string = if actual_stream { Some("alt=sse") } else { None };
 
         let response = match upstream
-            .call_v1_internal(method, &access_token, gemini_body, query_string)
+            .call_v1_internal(method, &access_token, gemini_body, query_string, Some(account_id.as_str()))
             .await
         {
             Ok(r) => r,
@@ -212,12 +243,27 @@ pub async fn handle_chat_completions(
                 use axum::response::Response;
                 use futures::StreamExt;
 
-                let gemini_stream = response.bytes_stream();
+                let meta = json!({
+                    "protocol": "openai",
+                    "trace_id": trace_id,
+                    "original_model": openai_req.model,
+                    "mapped_model": mapped_model,
+                    "request_type": config.request_type,
+                    "attempt": attempt,
+                    "status": status.as_u16(),
+                });
+                let gemini_stream = debug_logger::wrap_reqwest_stream_with_debug(
+                    Box::pin(response.bytes_stream()),
+                    debug_cfg.clone(),
+                    trace_id.clone(),
+                    "upstream_response",
+                    meta,
+                );
 
                 // [P1 FIX] Enhanced Peek logic to handle heartbeats and slow start
                 // Pre-read until we find meaningful content, skip heartbeats
                 let mut openai_stream =
-                    create_openai_sse_stream(Box::pin(gemini_stream), openai_req.model.clone());
+                    create_openai_sse_stream(gemini_stream, openai_req.model.clone());
 
                 let mut first_data_chunk = None;
                 let mut retry_this_account = false;
@@ -369,6 +415,20 @@ pub async fn handle_chat_completions(
             status_code,
             error_text
         );
+        if debug_logger::is_enabled(&debug_cfg) {
+            let payload = json!({
+                "kind": "upstream_response_error",
+                "protocol": "openai",
+                "trace_id": trace_id,
+                "original_model": openai_req.model,
+                "mapped_model": mapped_model,
+                "request_type": config.request_type,
+                "attempt": attempt,
+                "status": status_code,
+                "error_text": error_text,
+            });
+            debug_logger::write_debug_payload(&debug_cfg, Some(&trace_id), "upstream_response_error", &payload).await;
+        }
 
         // 确定重试策略
         let strategy = determine_retry_strategy(status_code, &error_text, false);
@@ -461,6 +521,43 @@ pub async fn handle_chat_completions(
 
         // 只有 403 (权限/地区限制) 和 401 (认证失效) 触发账号轮换
         if status_code == 403 || status_code == 401 {
+            if apply_retry_strategy(
+                RetryStrategy::FixedDelay(Duration::from_millis(200)),
+                attempt,
+                max_attempts,
+                status_code,
+                &trace_id,
+            )
+            .await
+            {
+                continue;
+            }
+        }
+
+        // 只有 403 (权限/地区限制) 和 401 (认证失效) 触发账号轮换
+        if status_code == 403 || status_code == 401 {
+            // [NEW] Check for VALIDATION_REQUIRED error - temporarily block account
+            if status_code == 403 && (
+                error_text.contains("VALIDATION_REQUIRED") || 
+                error_text.contains("verify your account") ||
+                error_text.contains("validation_url")
+            ) {
+                tracing::warn!(
+                    "[OpenAI] VALIDATION_REQUIRED detected on account {}, temporarily blocking",
+                    email
+                );
+                // Block for 10 minutes (default, configurable via config file)
+                let block_minutes = 10i64;
+                let block_until = chrono::Utc::now().timestamp() + (block_minutes * 60);
+                
+                // Get account_id from token_manager via email lookup
+                if let Some(acc_id) = token_manager.get_account_id_by_email(&email) {
+                    if let Err(e) = token_manager.set_validation_block_public(&acc_id, block_until, &error_text).await {
+                        tracing::error!("Failed to set validation block: {}", e);
+                    }
+                }
+            }
+            
             if apply_retry_strategy(
                 RetryStrategy::FixedDelay(Duration::from_millis(200)),
                 attempt,
@@ -925,7 +1022,7 @@ pub async fn handle_completions(
         // 重试时强制轮换，除非只是简单的网络抖动但 Claude 逻辑里 attempt > 0 总是 force_rotate
         let force_rotate = attempt > 0;
 
-        let (access_token, project_id, email, _wait_ms) = match token_manager
+        let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
             .get_token(
                 &config.request_type,
                 force_rotate,
@@ -973,7 +1070,7 @@ pub async fn handle_completions(
         let query_string = if list_response { Some("alt=sse") } else { None };
 
         let response = match upstream
-            .call_v1_internal(method, &access_token, gemini_body, query_string)
+            .call_v1_internal(method, &access_token, gemini_body, query_string, Some(account_id.as_str()))
             .await
         {
             Ok(r) => r,
@@ -1400,7 +1497,7 @@ pub async fn handle_images_generations(
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager;
 
-    let (access_token, project_id, email, _wait_ms) = match token_manager
+    let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
         .get_token("image_gen", false, None, "dall-e-3")
         .await
     {
@@ -1427,6 +1524,7 @@ pub async fn handle_images_generations(
         let _response_format = response_format.to_string();
 
         let model_to_use = "gemini-3-pro-image".to_string();
+        let account_id = account_id.clone();
 
         tasks.push(tokio::spawn(async move {
             let gemini_body = json!({
@@ -1455,7 +1553,7 @@ pub async fn handle_images_generations(
             });
 
             match upstream
-                .call_v1_internal("generateContent", &access_token, gemini_body, None)
+                .call_v1_internal("generateContent", &access_token, gemini_body, None, Some(account_id.as_str()))
                 .await
             {
                 Ok(response) => {
@@ -1673,7 +1771,7 @@ pub async fn handle_images_edits(
     // 1. Get Upstream & Token
     let upstream = state.upstream.clone();
     let token_manager = state.token_manager;
-    let (access_token, project_id, email, _wait_ms) = match token_manager
+    let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
         .get_token("image_gen", false, None, "dall-e-3")
         .await
     {
@@ -1787,10 +1885,11 @@ pub async fn handle_images_edits(
         let upstream = upstream.clone();
         let access_token = access_token.clone();
         let body = gemini_body.clone();
+        let account_id = account_id.clone();
 
         tasks.push(tokio::spawn(async move {
             match upstream
-                .call_v1_internal("generateContent", &access_token, body, None)
+                .call_v1_internal("generateContent", &access_token, body, None, Some(account_id.as_str()))
                 .await
             {
                 Ok(response) => {
